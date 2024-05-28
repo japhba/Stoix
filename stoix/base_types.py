@@ -78,6 +78,9 @@ class RNNEvalState(NamedTuple):
     hstate: HiddenState
     step_count: chex.Array
     episode_return: chex.Array
+    t_wait: chex.Array
+    action_count: chex.Array
+    t_wait_avg: chex.Array
 
 
 StoixState = TypeVar(

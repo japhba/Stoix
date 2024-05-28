@@ -182,6 +182,9 @@ def get_rnn_evaluator_fn(
                 hstate,
                 step_count,
                 episode_return,
+                t_wait,
+                action_count,
+                t_wait_avg,
             ) = eval_state
 
             # PRNG keys.
@@ -196,12 +199,28 @@ def get_rnn_evaluator_fn(
             # Run the network.
             hstate, action = rec_act_fn(params, hstate, ac_in, policy_key)
 
+            # jax.debug.print("t_wait {}", (action[-1].squeeze(0), action_count, t_wait, t_wait_avg))
+
+            t_wait, action_count, t_wait_avg = jax.lax.cond(
+                (env_state.x[..., -1]) & (env_state.ITI_counter == -1) & (env_state.ITI_counter == -1),
+                lambda _: jax.lax.cond(
+                    (action[-1].squeeze(0) == 1),
+                    lambda _: (0.0, action_count + 1, (action_count * t_wait_avg + 1.*(t_wait + 1)) / (action_count + 1),),
+                    lambda _: (t_wait + 1, action_count, t_wait_avg),
+                    None,
+                ),
+                lambda _: (0.0, action_count, t_wait_avg), 
+                None,
+            )
+
+            
             # Step environment.
             env_state, timestep = env.step(env_state, action[-1].squeeze(0))
 
             # Log episode metrics.
             episode_return += timestep.reward
             step_count += 1
+
             eval_state = RNNEvalState(
                 key,
                 env_state,
@@ -210,6 +229,9 @@ def get_rnn_evaluator_fn(
                 hstate,
                 step_count,
                 episode_return,
+                t_wait,
+                action_count,
+                t_wait_avg,
             )
             return eval_state
 
@@ -219,11 +241,13 @@ def get_rnn_evaluator_fn(
             is_not_done: bool = ~timestep.last()
             return is_not_done
 
-        final_state = jax.lax.while_loop(not_done, _env_step, init_eval_state)
+        with jax.disable_jit(False):
+            final_state = jax.lax.while_loop(not_done, _env_step, init_eval_state)
 
         eval_metrics = {
             "episode_return": final_state.episode_return,
             "episode_length": final_state.step_count,
+            "t_wait_avg": final_state.t_wait_avg,
         }
         # Log won episode if win rate is required.
         if log_win_rate:
@@ -265,6 +289,9 @@ def get_rnn_evaluator_fn(
             hstate=init_hstate,
             step_count=jnp.zeros((eval_batch, 1)),
             episode_return=jnp.zeros_like(timesteps.reward),
+            t_wait=jnp.zeros_like(timesteps.reward),
+            action_count=jnp.zeros_like(timesteps.reward),
+            t_wait_avg=jnp.zeros_like(timesteps.reward),
         )
 
         eval_metrics = jax.vmap(
