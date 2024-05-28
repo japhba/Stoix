@@ -18,7 +18,14 @@ from jumanji.types import TimeStep
 from omegaconf import DictConfig, OmegaConf
 from rich.pretty import pprint
 
-from stoix.base_types import ActorApply, ExperimentOutput, LearnerFn, LogEnvState
+from stoix.base_types import (
+    ActorApply,
+    ContinuousQApply,
+    ExperimentOutput,
+    LearnerFn,
+    LogEnvState,
+    OnlineAndTarget,
+)
 from stoix.evaluator import evaluator_setup, get_distribution_act_fn
 from stoix.networks.base import CompositeNetwork
 from stoix.networks.base import FeedForwardActor as Actor
@@ -27,15 +34,12 @@ from stoix.systems.mpo.discrete_loss import (
     clip_categorical_mpo_params,
 )
 from stoix.systems.mpo.mpo_types import (
-    ActorAndTarget,
     CategoricalDualParams,
     MPOLearnerState,
     MPOOptStates,
     MPOParams,
     SequenceStep,
 )
-from stoix.systems.q_learning.dqn_types import QsAndTarget
-from stoix.systems.sac.sac_types import ContinuousQApply
 from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import (
@@ -210,18 +214,18 @@ def get_learner_fn(
                 target_q_params: FrozenDict,
                 online_actor_params: FrozenDict,
                 target_actor_params: FrozenDict,
-                sequences: SequenceStep,
+                sequence: SequenceStep,
                 rng_key: chex.PRNGKey,
             ) -> jnp.ndarray:
 
                 online_actor_policy = actor_apply_fn(
-                    online_actor_params, sequences.obs
+                    online_actor_params, sequence.obs
                 )  # [B, T, ...]
                 target_actor_policy = actor_apply_fn(
-                    target_actor_params, sequences.obs
+                    target_actor_params, sequence.obs
                 )  # [B, T, ...]
-                a_t = jax.nn.one_hot(sequences.action, config.system.action_dim)  # [B, T, ...]
-                online_q_t = q_apply_fn(online_q_params, sequences.obs, a_t)  # [B, T]
+                a_t = jax.nn.one_hot(sequence.action, config.system.action_dim)  # [B, T, ...]
+                online_q_t = q_apply_fn(online_q_params, sequence.obs, a_t)  # [B, T]
 
                 # Cast and clip rewards.
                 discount = 1.0 - sequence.done.astype(jnp.float32)
@@ -250,7 +254,7 @@ def get_learner_fn(
 
                 # Compute the Q-values for the next state-action pairs; [N, B, T].
                 q_values = jax.vmap(q_apply_fn, in_axes=(None, None, 0))(
-                    target_q_params, sequences.obs, a_evaluation
+                    target_q_params, sequence.obs, a_evaluation
                 )
 
                 # When policy_eval_stochastic == True, this corresponds to expected SARSA.
@@ -259,10 +263,10 @@ def get_learner_fn(
 
                 if config.system.use_retrace:
                     # Compute the log-rhos for the retrace targets.
-                    log_rhos = target_actor_policy.log_prob(sequences.action) - sequences.log_prob
+                    log_rhos = target_actor_policy.log_prob(sequence.action) - sequence.log_prob
 
                     # Compute target Q-values
-                    target_q_t = q_apply_fn(target_q_params, sequences.obs, a_t)  # [B, T]
+                    target_q_t = q_apply_fn(target_q_params, sequence.obs, a_t)  # [B, T]
 
                     # Compute retrace targets.
                     # These targets use the rewards and discounts as in normal TD-learning but
@@ -374,8 +378,8 @@ def get_learner_fn(
                 config.system.tau,
             )
 
-            actor_new_params = ActorAndTarget(actor_new_online_params, new_target_actor_params)
-            q_new_params = QsAndTarget(q_new_online_params, new_target_q_params)
+            actor_new_params = OnlineAndTarget(actor_new_online_params, new_target_actor_params)
+            q_new_params = OnlineAndTarget(q_new_online_params, new_target_q_params)
 
             # PACK NEW PARAMS AND OPTIMISER STATE
             new_params = MPOParams(actor_new_params, q_new_params, dual_new_params)
@@ -465,7 +469,9 @@ def learner_setup(
     # Initialise observation
     init_x = env.observation_spec().generate_value()
     init_x = jax.tree_util.tree_map(lambda x: x[None, ...], init_x)
-    init_a = jnp.zeros((1, action_dim))
+    init_a = env.action_spec().generate_value()
+    init_a = jax.nn.one_hot(init_a, action_dim)
+    init_a = jax.tree_util.tree_map(lambda x: x[None, ...], init_a)
 
     # Initialise actor params and optimiser state.
     actor_params = actor_network.init(actor_net_key, init_x)
@@ -495,8 +501,8 @@ def learner_setup(
     dual_opt_state = dual_optim.init(dual_params)
 
     params = MPOParams(
-        ActorAndTarget(actor_params, target_actor_params),
-        QsAndTarget(online_q_params, target_q_params),
+        OnlineAndTarget(actor_params, target_actor_params),
+        OnlineAndTarget(online_q_params, target_q_params),
         dual_params,
     )
     opt_states = MPOOptStates(actor_opt_state, q_opt_state, dual_opt_state)
@@ -527,8 +533,12 @@ def learner_setup(
         f"{Fore.RED}{Style.BRIGHT}The total batch size should be divisible "
         + "by the number of devices!{Style.RESET_ALL}"
     )
-    config.system.buffer_size = config.system.total_buffer_size // n_devices
-    config.system.batch_size = config.system.total_batch_size // n_devices
+    config.system.buffer_size = config.system.total_buffer_size // (
+        n_devices * config.arch.update_batch_size
+    )
+    config.system.batch_size = config.system.total_batch_size // (
+        n_devices * config.arch.update_batch_size
+    )
     buffer_fn = fbx.make_trajectory_buffer(
         max_size=config.system.buffer_size,
         min_length_time_axis=config.system.sample_sequence_length,
@@ -549,13 +559,13 @@ def learner_setup(
 
     # Initialise environment states and timesteps: across devices and batches.
     key, *env_keys = jax.random.split(
-        key, n_devices * config.system.update_batch_size * config.arch.num_envs + 1
+        key, n_devices * config.arch.update_batch_size * config.arch.num_envs + 1
     )
     env_states, timesteps = jax.vmap(env.reset, in_axes=(0))(
         jnp.stack(env_keys),
     )
     reshape_states = lambda x: x.reshape(
-        (n_devices, config.system.update_batch_size, config.arch.num_envs) + x.shape[1:]
+        (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
     )
     # (devices, update batch size, num_envs, ...)
     env_states = jax.tree_util.tree_map(reshape_states, env_states)
@@ -574,16 +584,16 @@ def learner_setup(
 
     # Define params to be replicated across devices and batches.
     key, step_key, warmup_key = jax.random.split(key, num=3)
-    step_keys = jax.random.split(step_key, n_devices * config.system.update_batch_size)
-    warmup_keys = jax.random.split(warmup_key, n_devices * config.system.update_batch_size)
-    reshape_keys = lambda x: x.reshape((n_devices, config.system.update_batch_size) + x.shape[1:])
+    step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
+    warmup_keys = jax.random.split(warmup_key, n_devices * config.arch.update_batch_size)
+    reshape_keys = lambda x: x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])
     step_keys = reshape_keys(jnp.stack(step_keys))
     warmup_keys = reshape_keys(jnp.stack(warmup_keys))
 
     replicate_learner = (params, opt_states, buffer_states)
 
     # Duplicate learner for update_batch_size.
-    broadcast = lambda x: jnp.broadcast_to(x, (config.system.update_batch_size,) + x.shape)
+    broadcast = lambda x: jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
 
     # Duplicate learner across devices.
@@ -642,7 +652,7 @@ def run_experiment(_config: DictConfig) -> float:
         n_devices
         * config.arch.num_updates_per_eval
         * config.system.rollout_length
-        * config.system.update_batch_size
+        * config.arch.update_batch_size
         * config.arch.num_envs
     )
 

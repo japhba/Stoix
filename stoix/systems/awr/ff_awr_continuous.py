@@ -20,6 +20,8 @@ from rich.pretty import pprint
 
 from stoix.base_types import (
     ActorApply,
+    ActorCriticOptStates,
+    ActorCriticParams,
     CriticApply,
     ExperimentOutput,
     LearnerFn,
@@ -29,7 +31,6 @@ from stoix.evaluator import evaluator_setup, get_distribution_act_fn
 from stoix.networks.base import FeedForwardActor as Actor
 from stoix.networks.base import FeedForwardCritic as Critic
 from stoix.systems.awr.awr_types import AWRLearnerState, SequenceStep
-from stoix.systems.ppo.ppo_types import ActorCriticOptStates, ActorCriticParams
 from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
@@ -429,8 +430,12 @@ def learner_setup(
         f"{Fore.RED}{Style.BRIGHT}The total batch size should be divisible "
         + "by the number of devices!{Style.RESET_ALL}"
     )
-    config.system.buffer_size = config.system.total_buffer_size // n_devices
-    config.system.batch_size = config.system.total_batch_size // n_devices
+    config.system.buffer_size = config.system.total_buffer_size // (
+        n_devices * config.arch.update_batch_size
+    )
+    config.system.batch_size = config.system.total_batch_size // (
+        n_devices * config.arch.update_batch_size
+    )
     buffer_fn = fbx.make_trajectory_buffer(
         max_size=config.system.buffer_size,
         min_length_time_axis=config.system.sample_sequence_length,
@@ -451,13 +456,13 @@ def learner_setup(
 
     # Initialise environment states and timesteps: across devices and batches.
     key, *env_keys = jax.random.split(
-        key, n_devices * config.system.update_batch_size * config.arch.num_envs + 1
+        key, n_devices * config.arch.update_batch_size * config.arch.num_envs + 1
     )
     env_states, timesteps = jax.vmap(env.reset, in_axes=(0))(
         jnp.stack(env_keys),
     )
     reshape_states = lambda x: x.reshape(
-        (n_devices, config.system.update_batch_size, config.arch.num_envs) + x.shape[1:]
+        (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
     )
     # (devices, update batch size, num_envs, ...)
     env_states = jax.tree_util.tree_map(reshape_states, env_states)
@@ -476,16 +481,16 @@ def learner_setup(
 
     # Define params to be replicated across devices and batches.
     key, step_key, warmup_key = jax.random.split(key, num=3)
-    step_keys = jax.random.split(step_key, n_devices * config.system.update_batch_size)
-    warmup_keys = jax.random.split(warmup_key, n_devices * config.system.update_batch_size)
-    reshape_keys = lambda x: x.reshape((n_devices, config.system.update_batch_size) + x.shape[1:])
+    step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
+    warmup_keys = jax.random.split(warmup_key, n_devices * config.arch.update_batch_size)
+    reshape_keys = lambda x: x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])
     step_keys = reshape_keys(jnp.stack(step_keys))
     warmup_keys = reshape_keys(jnp.stack(warmup_keys))
 
     replicate_learner = (params, opt_states, buffer_states)
 
     # Duplicate learner for update_batch_size.
-    broadcast = lambda x: jnp.broadcast_to(x, (config.system.update_batch_size,) + x.shape)
+    broadcast = lambda x: jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
 
     # Duplicate learner across devices.
@@ -544,7 +549,7 @@ def run_experiment(_config: DictConfig) -> float:
         n_devices
         * config.arch.num_updates_per_eval
         * config.system.rollout_length
-        * config.system.update_batch_size
+        * config.arch.update_batch_size
         * config.arch.num_envs
     )
 

@@ -14,16 +14,18 @@ from jumanji.env import Environment
 from omegaconf import DictConfig, OmegaConf
 from rich.pretty import pprint
 
-from stoix.base_types import ExperimentOutput, LearnerFn, RecActorApply, RecCriticApply
-from stoix.evaluator import evaluator_setup, get_rec_distribution_act_fn
-from stoix.networks.base import RecurrentActor, RecurrentCritic, ScannedRNN
-from stoix.systems.ppo.ppo_types import (
+from stoix.base_types import (
     ActorCriticOptStates,
     ActorCriticParams,
-    HiddenStates,
+    ExperimentOutput,
+    LearnerFn,
+    RecActorApply,
+    RecCriticApply,
     RNNLearnerState,
-    RNNPPOTransition,
 )
+from stoix.evaluator import evaluator_setup, get_rec_distribution_act_fn
+from stoix.networks.base import RecurrentActor, RecurrentCritic, ScannedRNN
+from stoix.systems.ppo.ppo_types import ActorCriticHiddenStates, RNNPPOTransition
 from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
@@ -62,7 +64,7 @@ def get_learner_fn(
                 - env_state (State): The environment state.
                 - last_timestep (TimeStep): The last timestep in the current trajectory.
                 - dones (bool): Whether the last timestep was a terminal state.
-                - hstates (HiddenStates): The current hidden states of the RNN.
+                - hstates (ActorCriticHiddenStates): The current hidden states of the RNN.
             _ (Any): The current metrics info.
         """
 
@@ -77,6 +79,7 @@ def get_learner_fn(
                 env_state,
                 last_timestep,
                 last_done,
+                last_truncated,
                 hstates,
             ) = learner_state
 
@@ -116,10 +119,10 @@ def get_learner_fn(
             truncated = (timestep.last() & (timestep.discount != 0.0)).reshape(-1)
             info = timestep.extras["episode_metrics"]
 
-            hstates = HiddenStates(policy_hidden_state, critic_hidden_state)
+            hstates = ActorCriticHiddenStates(policy_hidden_state, critic_hidden_state)
             transition = RNNPPOTransition(
-                done,
-                truncated,
+                last_done,
+                last_truncated,
                 action,
                 value,
                 timestep.reward,
@@ -135,6 +138,7 @@ def get_learner_fn(
                 env_state,
                 timestep,
                 done,
+                truncated,
                 hstates,
             )
             return learner_state, transition
@@ -155,6 +159,7 @@ def get_learner_fn(
             env_state,
             last_timestep,
             last_done,
+            last_truncated,
             hstates,
         ) = learner_state
 
@@ -386,6 +391,7 @@ def get_learner_fn(
             env_state,
             last_timestep,
             last_done,
+            last_truncated,
             hstates,
         )
         metric = traj_batch.info
@@ -406,7 +412,7 @@ def get_learner_fn(
                 - env_state (LogEnvState): The environment state.
                 - timesteps (TimeStep): The initial timestep in the initial trajectory.
                 - dones (bool): Whether the initial timestep was a terminal state.
-                - hstateS (HiddenStates): The initial hidden states of the RNN.
+                - hstateS (ActorCriticHiddenStates): The initial hidden states of the RNN.
         """
 
         batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
@@ -519,7 +525,7 @@ def learner_setup(
 
     # Pack params and initial states.
     params = ActorCriticParams(actor_params, critic_params)
-    hstates = HiddenStates(init_policy_hstate, init_critic_hstate)
+    hstates = ActorCriticHiddenStates(init_policy_hstate, init_critic_hstate)
 
     # Load model from checkpoint if specified.
     if config.logger.checkpointing.load_model:
@@ -535,13 +541,13 @@ def learner_setup(
 
     # Initialise environment states and timesteps: across devices and batches.
     key, *env_keys = jax.random.split(
-        key, n_devices * config.system.update_batch_size * config.arch.num_envs + 1
+        key, n_devices * config.arch.update_batch_size * config.arch.num_envs + 1
     )
     env_states, timesteps = jax.vmap(env.reset, in_axes=(0))(
         jnp.stack(env_keys),
     )
     reshape_states = lambda x: x.reshape(
-        (n_devices, config.system.update_batch_size, config.arch.num_envs) + x.shape[1:]
+        (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
     )
     # (devices, update batch size, num_envs, ...)
     env_states = jax.tree_util.tree_map(reshape_states, env_states)
@@ -552,29 +558,34 @@ def learner_setup(
         (config.arch.num_envs,),
         dtype=bool,
     )
+    truncated = jnp.zeros(
+        (config.arch.num_envs,),
+        dtype=bool,
+    )
     key, step_key = jax.random.split(key)
-    step_keys = jax.random.split(step_key, n_devices * config.system.update_batch_size)
-    reshape_keys = lambda x: x.reshape((n_devices, config.system.update_batch_size) + x.shape[1:])
+    step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
+    reshape_keys = lambda x: x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])
     step_keys = reshape_keys(jnp.stack(step_keys))
     opt_states = ActorCriticOptStates(actor_opt_state, critic_opt_state)
-    replicate_learner = (params, opt_states, hstates, dones)
+    replicate_learner = (params, opt_states, hstates, dones, truncated)
 
     # Duplicate learner for update_batch_size.
-    broadcast = lambda x: jnp.broadcast_to(x, (config.system.update_batch_size,) + x.shape)
+    broadcast = lambda x: jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
 
     # Duplicate learner across devices.
     replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
 
     # Initialise learner state.
-    params, opt_states, hstates, dones = replicate_learner
+    params, opt_states, hstates, dones, truncated = replicate_learner
     init_learner_state = RNNLearnerState(
         params=params,
         opt_states=opt_states,
         key=step_keys,
         env_state=env_states,
         timestep=timesteps,
-        dones=dones,
+        done=dones,
+        truncated=truncated,
         hstates=hstates,
     )
     return learn, actor_network, actor_rnn, init_learner_state
@@ -630,7 +641,7 @@ def run_experiment(_config: DictConfig) -> float:
         n_devices
         * config.arch.num_updates_per_eval
         * config.system.rollout_length
-        * config.system.update_batch_size
+        * config.arch.update_batch_size
         * config.arch.num_envs
     )
 
