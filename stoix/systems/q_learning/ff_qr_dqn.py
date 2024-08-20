@@ -304,7 +304,6 @@ def learner_setup(
         config.network.actor_network.action_head,
         action_dim=action_dim,
         epsilon=config.system.training_epsilon,
-        num_quantiles=config.system.num_quantiles,
     )
 
     q_network = Actor(torso=q_network_torso, action_head=q_network_action_head)
@@ -313,7 +312,6 @@ def learner_setup(
         config.network.actor_network.action_head,
         action_dim=action_dim,
         epsilon=config.system.evaluation_epsilon,
-        num_quantiles=config.system.num_quantiles,
     )
     eval_q_network = Actor(torso=q_network_torso, action_head=eval_q_network_action_head)
     eval_q_network = EvalActorWrapper(actor=eval_q_network)
@@ -447,7 +445,7 @@ def run_experiment(_config: DictConfig) -> float:
     config.num_devices = n_devices
     config = check_total_timesteps(config)
     assert (
-        config.arch.num_updates > config.arch.num_evaluation
+        config.arch.num_updates >= config.arch.num_evaluation
     ), "Number of updates per evaluation must be less than total number of updates."
 
     # Create the environments for train and eval.
@@ -575,7 +573,11 @@ def run_experiment(_config: DictConfig) -> float:
     return eval_performance
 
 
-@hydra.main(config_path="../../configs", config_name="default_ff_qr_dqn.yaml", version_base="1.2")
+@hydra.main(
+    config_path="../../configs/default/anakin",
+    config_name="default_ff_qr_dqn.yaml",
+    version_base="1.2",
+)
 def hydra_entry_point(cfg: DictConfig) -> float:
     """Experiment entry point."""
     # Allow dynamic attributes.
