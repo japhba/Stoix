@@ -2,7 +2,7 @@ import abc
 import threading
 from typing import Any
 
-import envpool
+# import envpool
 import gymnasium
 
 from stoix.wrappers.envpool import EnvPoolToJumanji

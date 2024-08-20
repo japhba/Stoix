@@ -1,9 +1,9 @@
 brax>=0.9.0
 chex
 colorama
-craftax
+# craftax
 distrax @ git+https://github.com/google-deepmind/distrax  # distrax release doesn't support jax > 0.4.13
-envpool
+# envpool
 flashbax @ git+https://github.com/instadeepai/flashbax
 flax
 gymnasium
