@@ -8,4 +8,4 @@ defaults:
 
 hydra:
   searchpath:
-    - /Users/jan/repos/enzyme-of-computation/Stoix/stoix/configs
+    - /root/enzyme-of-computation/Stoix/stoix/configs

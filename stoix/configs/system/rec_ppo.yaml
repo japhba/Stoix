@@ -5,9 +5,9 @@ system_name: rec_ppo # Name of the system.
 # --- RL hyperparameters ---
 actor_lr: 1e-4 # Learning rate for actor network
 critic_lr: 1e-4 # Learning rate for critic network
-rollout_length: 8192 # Number of environment steps per vectorised environment.
+rollout_length: 4096 # Number of environment steps per vectorised environment.
 epochs: 4 # Number of ppo epochs per training data batch.
-num_minibatches: 32 # Number of minibatches per ppo epoch.
+num_minibatches: 1 # Number of minibatches per ppo epoch.
 gamma: 0.995 # Discounting factor.
 gae_lambda: 0.95 # Lambda value for GAE computation.
 clip_eps: 0.01 # Clipping value for PPO updates and value function.
