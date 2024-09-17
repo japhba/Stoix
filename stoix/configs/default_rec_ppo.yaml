@@ -5,7 +5,3 @@ defaults:
   - network: rnn
   - env: gymnax/cartpole
   - _self_
-
-hydra:
-  searchpath:
-    - file://.venv/src/stoix/stoix/configs
