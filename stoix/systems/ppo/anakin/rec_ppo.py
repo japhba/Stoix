@@ -17,7 +17,7 @@ from rich.pretty import pprint
 from stoix.base_types import (
     ActorCriticOptStates,
     ActorCriticParams,
-    ExperimentOutput,
+    AnakinExperimentOutput,
     LearnerFn,
     RecActorApply,
     RecCriticApply,
@@ -400,7 +400,7 @@ def get_learner_fn(
         metric = traj_batch.info
         return learner_state, (metric, loss_info)
 
-    def learner_fn(learner_state: RNNLearnerState) -> ExperimentOutput[RNNLearnerState]:
+    def learner_fn(learner_state: RNNLearnerState) -> AnakinExperimentOutput[RNNLearnerState]:
         """Learner function.
 
         This function represents the learner, it updates the network parameters
@@ -423,7 +423,7 @@ def get_learner_fn(
         learner_state, (episode_info, loss_info) = jax.lax.scan(
             batched_update_step, learner_state, None, config.arch.num_updates_per_eval
         )
-        return ExperimentOutput(
+        return AnakinExperimentOutput(
             learner_state=learner_state,
             episode_metrics=episode_info,
             train_metrics=loss_info,
@@ -682,7 +682,15 @@ def run_experiment(_config: DictConfig) -> float:
         logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
         if ep_completed:  # only log episode metrics if an episode was completed in the rollout.
             logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
-        logger.log(learner_output.train_metrics, t, eval_step, LogEvent.TRAIN)
+        train_metrics = learner_output.train_metrics
+        # Calculate the number of optimiser steps per second. Since gradients are aggregated
+        # across the device and batch axis, we don't consider updates per device/batch as part of
+        # the SPS for the learner.
+        opt_steps_per_eval = config.arch.num_updates_per_eval * (
+            config.system.epochs * config.system.num_minibatches
+        )
+        train_metrics["steps_per_second"] = opt_steps_per_eval / elapsed_time
+        logger.log(train_metrics, t, eval_step, LogEvent.TRAIN)
 
         # Prepare for evaluation.
         start_time = time.time()
